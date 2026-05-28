@@ -63,6 +63,27 @@ async function initializeDatabase() {
       ON novedades(plu, posicion, fecha);
     `);
 
+    // ── Tabla transporte_guardados ──
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS transporte_guardados (
+        id           SERIAL PRIMARY KEY,
+        client_id    VARCHAR(100) NOT NULL UNIQUE,
+        fecha        DATE NOT NULL,
+        documento    VARCHAR(255) NOT NULL,
+        ubicacion    TEXT NOT NULL,
+        estado       VARCHAR(60) NOT NULL DEFAULT 'PENDIENTE DESPACHO',
+        fecha_despacho DATE,
+        nota         TEXT,
+        created_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    await client.query(`
+      CREATE INDEX IF NOT EXISTS idx_transporte_client_id
+      ON transporte_guardados(client_id);
+    `);
+
     console.log('Database initialized successfully');
   } catch (err) {
     console.error('Database initialization error:', err);
@@ -413,6 +434,131 @@ app.post('/api/novedades/bulk/delete', async (req, res) => {
       error: 'Error bulk deleting novedades',
       message: err.message,
     });
+  }
+});
+
+// =====================================================
+// Transporte Guardados Routes
+// =====================================================
+
+/**
+ * GET /api/transporte
+ * Retorna todos los guardados ordenados por fecha desc
+ */
+app.get('/api/transporte', async (req, res) => {
+  try {
+    const result = await pool.query(
+      'SELECT * FROM transporte_guardados ORDER BY fecha DESC, created_at DESC'
+    );
+    res.json({ success: true, data: result.rows, count: result.rows.length });
+  } catch (err) {
+    console.error('Error fetching transporte:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/transporte
+ * Upsert por client_id — crea o actualiza el registro
+ */
+app.post('/api/transporte', async (req, res) => {
+  try {
+    const { client_id, fecha, documento, ubicacion, estado, fecha_despacho, nota } = req.body;
+
+    if (!client_id || !fecha || !documento || !ubicacion) {
+      return res.status(400).json({ success: false, error: 'Faltan campos: client_id, fecha, documento, ubicacion' });
+    }
+
+    const result = await pool.query(
+      `INSERT INTO transporte_guardados
+         (client_id, fecha, documento, ubicacion, estado, fecha_despacho, nota, updated_at)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+       ON CONFLICT (client_id) DO UPDATE SET
+         fecha          = EXCLUDED.fecha,
+         documento      = EXCLUDED.documento,
+         ubicacion      = EXCLUDED.ubicacion,
+         estado         = EXCLUDED.estado,
+         fecha_despacho = EXCLUDED.fecha_despacho,
+         nota           = EXCLUDED.nota,
+         updated_at     = CURRENT_TIMESTAMP
+       RETURNING *`,
+      [client_id, fecha, documento, ubicacion,
+       estado || 'PENDIENTE DESPACHO',
+       fecha_despacho || null,
+       nota || '']
+    );
+
+    res.status(201).json({ success: true, data: result.rows[0] });
+  } catch (err) {
+    console.error('Error upserting transporte:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * POST /api/transporte/bulk
+ * Upsert masivo — recibe array de guardados
+ */
+app.post('/api/transporte/bulk', async (req, res) => {
+  try {
+    const { records } = req.body;
+    if (!Array.isArray(records) || records.length === 0) {
+      return res.status(400).json({ success: false, error: 'records debe ser un array no vacío' });
+    }
+
+    const results = [];
+    for (const r of records) {
+      const { client_id, fecha, documento, ubicacion, estado, fecha_despacho, nota } = r;
+      if (!client_id || !fecha || !documento || !ubicacion) continue;
+
+      const row = await pool.query(
+        `INSERT INTO transporte_guardados
+           (client_id, fecha, documento, ubicacion, estado, fecha_despacho, nota, updated_at)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, CURRENT_TIMESTAMP)
+         ON CONFLICT (client_id) DO UPDATE SET
+           fecha          = EXCLUDED.fecha,
+           documento      = EXCLUDED.documento,
+           ubicacion      = EXCLUDED.ubicacion,
+           estado         = EXCLUDED.estado,
+           fecha_despacho = EXCLUDED.fecha_despacho,
+           nota           = EXCLUDED.nota,
+           updated_at     = CURRENT_TIMESTAMP
+         RETURNING *`,
+        [client_id, fecha, documento, ubicacion,
+         estado || 'PENDIENTE DESPACHO',
+         fecha_despacho || null,
+         nota || '']
+      );
+      results.push(row.rows[0]);
+    }
+
+    res.json({ success: true, data: results, count: results.length });
+  } catch (err) {
+    console.error('Error bulk upserting transporte:', err);
+    res.status(500).json({ success: false, error: err.message });
+  }
+});
+
+/**
+ * DELETE /api/transporte/:clientId
+ * Elimina un guardado por su client_id
+ */
+app.delete('/api/transporte/:clientId', async (req, res) => {
+  try {
+    const { clientId } = req.params;
+    const result = await pool.query(
+      'DELETE FROM transporte_guardados WHERE client_id = $1 RETURNING *',
+      [clientId]
+    );
+
+    if (result.rows.length === 0) {
+      return res.status(404).json({ success: false, error: 'Guardado no encontrado' });
+    }
+
+    res.json({ success: true, data: result.rows[0], message: 'Guardado eliminado' });
+  } catch (err) {
+    console.error('Error deleting transporte:', err);
+    res.status(500).json({ success: false, error: err.message });
   }
 });
 
