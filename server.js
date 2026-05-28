@@ -84,6 +84,15 @@ async function initializeDatabase() {
       ON transporte_guardados(client_id);
     `);
 
+    // ── Tabla tombstone: client_ids borrados permanentemente ──
+    // Evita que cualquier dispositivo (incluso con código viejo) re-cree un registro borrado
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS transporte_deleted (
+        client_id  VARCHAR(100) PRIMARY KEY,
+        deleted_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
     console.log('Database initialized successfully');
   } catch (err) {
     console.error('Database initialization error:', err);
@@ -469,6 +478,15 @@ app.post('/api/transporte', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Faltan campos: client_id, fecha, documento, ubicacion' });
     }
 
+    // Si el registro fue borrado, no permitir re-insertarlo (protección anti ping-pong)
+    const tomb = await pool.query(
+      'SELECT 1 FROM transporte_deleted WHERE client_id = $1',
+      [client_id]
+    );
+    if (tomb.rows.length > 0) {
+      return res.status(200).json({ success: true, skipped: true, message: 'Registro borrado — no se re-inserta' });
+    }
+
     const result = await pool.query(
       `INSERT INTO transporte_guardados
          (client_id, fecha, documento, ubicacion, estado, fecha_despacho, nota, updated_at)
@@ -506,10 +524,15 @@ app.post('/api/transporte/bulk', async (req, res) => {
       return res.status(400).json({ success: false, error: 'records debe ser un array no vacío' });
     }
 
+    // Cargar tombstones para saltar registros borrados
+    const tombRes = await pool.query('SELECT client_id FROM transporte_deleted');
+    const deletedSet = new Set(tombRes.rows.map(t => t.client_id));
+
     const results = [];
     for (const r of records) {
       const { client_id, fecha, documento, ubicacion, estado, fecha_despacho, nota } = r;
       if (!client_id || !fecha || !documento || !ubicacion) continue;
+      if (deletedSet.has(client_id)) continue; // no re-insertar registros borrados
 
       const row = await pool.query(
         `INSERT INTO transporte_guardados
@@ -551,11 +574,20 @@ app.delete('/api/transporte/:clientId', async (req, res) => {
       [clientId]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, error: 'Guardado no encontrado' });
-    }
+    // Registrar el tombstone SIEMPRE (aunque el registro no exista aún),
+    // para bloquear re-inserciones por race conditions o dispositivos con código viejo
+    await pool.query(
+      `INSERT INTO transporte_deleted (client_id)
+       VALUES ($1)
+       ON CONFLICT (client_id) DO NOTHING`,
+      [clientId]
+    );
 
-    res.json({ success: true, data: result.rows[0], message: 'Guardado eliminado' });
+    res.json({
+      success: true,
+      data: result.rows[0] || null,
+      message: result.rows.length > 0 ? 'Guardado eliminado' : 'Guardado marcado como eliminado'
+    });
   } catch (err) {
     console.error('Error deleting transporte:', err);
     res.status(500).json({ success: false, error: err.message });
